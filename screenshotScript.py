@@ -13,7 +13,7 @@ import os
 import sys
 import logging
 import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -44,7 +44,7 @@ class ScreenshotTool:
         # 创建输出目录
         self.output_dir.mkdir(exist_ok=True)
     
-    async def capture_screenshot(self, url: str, page) -> bool:
+    async def capture_screenshot(self, url: str, page) -> Tuple[bool, str]:
         """
         捕获单个URL的截图
         
@@ -53,7 +53,7 @@ class ScreenshotTool:
             page: Playwright Page对象
         
         Returns:
-            是否截图成功
+            (是否成功, 页面标题)
         """
         try:
             # 清理URL，用于文件名
@@ -63,8 +63,20 @@ class ScreenshotTool:
             # 尝试加载页面
             try:
                 await page.goto(url, timeout=30000, wait_until='networkidle')
+                
+                # 获取页面标题
+                title = await page.title()
+                if not title or title.strip() == '':
+                    title = url  # 如果标题为空，使用URL作为标题
+                else:
+                    # 清理标题中的换行符和多余空格
+                    title = title.replace('\n', ' ').replace('\r', '').strip()
+                
+                logger.info(f"获取到页面标题: {title[:50]}...")
+                
             except Exception as e:
                 logger.warning(f"页面加载异常但尝试截图: {url}, 错误: {str(e)[:50]}")
+                title = ''  # 加载异常时使用URL作为标题
             
             # 截图
             await page.screenshot(
@@ -74,14 +86,14 @@ class ScreenshotTool:
             )
             
             logger.info(f"截图成功: {url} -> {output_path}")
-            return True
+            return True, title
             
         except asyncio.TimeoutError:
             logger.error(f"截图超时: {url}")
-            return False
+            return False, url
         except Exception as e:
             logger.error(f"截图失败: {url}, 错误: {str(e)[:100]}")
-            return False
+            return False, url
     
     async def _capture_with_semaphore(self, url: str, context, semaphore: asyncio.Semaphore) -> tuple:
         """
@@ -93,17 +105,17 @@ class ScreenshotTool:
             semaphore: 并发控制信号量
         
         Returns:
-            (url, 是否成功) 元组
+            (url, 是否成功, 页面标题) 元组
         """
         async with semaphore:
             page = await context.new_page()
             try:
-                success = await self.capture_screenshot(url, page)
-                return (url, success)
+                success, title = await self.capture_screenshot(url, page)
+                return (url, success, title)
             finally:
                 await page.close()
     
-    async def capture_single_url(self, url: str) -> bool:
+    async def capture_single_url(self, url: str) -> Tuple[bool, str]:
         """
         截图单个URL
         
@@ -111,7 +123,7 @@ class ScreenshotTool:
             url: 目标URL
         
         Returns:
-            是否截图成功
+            (是否成功, 页面标题)
         """
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -132,16 +144,16 @@ class ScreenshotTool:
                 )
                 
                 page = await context.new_page()
-                success = await self.capture_screenshot(url, page)
+                success, title = await self.capture_screenshot(url, page)
                 await page.close()
                 await context.close()
                 
-                return success
+                return success, title
                 
             finally:
                 await browser.close()
     
-    async def capture_urls_from_file(self, file_path: str) -> dict:
+    async def capture_urls_from_file(self, file_path: str) -> Dict:
         """
         从文件读取URL列表进行批量截图
         
@@ -149,7 +161,7 @@ class ScreenshotTool:
             file_path: 包含URL列表的文件路径
         
         Returns:
-            统计信息字典
+            统计信息字典和标题映射
         """
         urls = self._read_urls_from_file(file_path)
         if not urls:
@@ -158,7 +170,7 @@ class ScreenshotTool:
         
         return await self.capture_urls(urls)
     
-    async def capture_urls(self, urls: List[str]) -> dict:
+    async def capture_urls(self, urls: List[str]) -> Dict:
         """
         批量截图URL列表
         
@@ -174,6 +186,9 @@ class ScreenshotTool:
         total = len(urls)
         successful = 0
         failed = 0
+        
+        # 存储URL和标题的映射
+        url_title_map = {}
         
         logger.info(f"开始批量截图 - URL数: {total}, 并发数: {self.concurrency}")
         
@@ -206,7 +221,11 @@ class ScreenshotTool:
                 
                 # 执行所有任务
                 for coro in asyncio.as_completed(tasks):
-                    url, success = await coro
+                    url, success, title = await coro
+                    
+                    # 存储标题信息
+                    url_title_map[url] = title
+                    
                     if success:
                         successful += 1
                     else:
@@ -225,7 +244,7 @@ class ScreenshotTool:
         
         # 生成HTML图片链接页面
         if successful > 0:
-            self._generate_html_gallery()
+            self._generate_html_gallery(url_title_map)
         
         return {'total': total, 'successful': successful, 'failed': failed}
     
@@ -293,9 +312,12 @@ class ScreenshotTool:
         
         return filename
     
-    def _generate_html_gallery(self) -> None:
+    def _generate_html_gallery(self, url_title_map: Dict[str, str] = None) -> None:
         """
         生成HTML图片链接页面，每行显示6个图片
+        
+        Args:
+            url_title_map: URL到标题的映射字典
         """
         # 获取当前时间，精确到秒
         html_filename = f"screenshots_{self.current_time}.html"
@@ -310,7 +332,7 @@ class ScreenshotTool:
         png_files.sort()
         
         # 生成HTML内容
-        html_content = self._build_html_content(png_files)
+        html_content = self._build_html_content(png_files, url_title_map)
         
         # 保存HTML文件
         with open(html_filename, 'w', encoding='utf-8') as f:
@@ -318,12 +340,13 @@ class ScreenshotTool:
         
         logger.info(f"HTML图片链接页面已生成: {html_filename}")
     
-    def _build_html_content(self, png_files: list) -> str:
+    def _build_html_content(self, png_files: list, url_title_map: Dict[str, str] = None) -> str:
         """
         构建HTML内容
         
         Args:
             png_files: PNG文件列表
+            url_title_map: URL到标题的映射字典
         
         Returns:
             HTML内容字符串
@@ -341,6 +364,7 @@ class ScreenshotTool:
             background-color: #f5f5f5;
         }
         .container {
+            max-width: 1400px;
             margin: 0 auto;
             background: white;
             padding: 20px;
@@ -355,33 +379,61 @@ class ScreenshotTool:
         .gallery {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 15px;
+            gap: 20px;
         }
         .screenshot-item {
             text-align: center;
             border: 1px solid #ddd;
-            border-radius: 4px;
-            padding: 10px;
+            border-radius: 8px;
+            padding: 15px;
             background: #fafafa;
             transition: transform 0.2s;
+            display: flex;
+            flex-direction: column;
+            height: 320px;
+            overflow: hidden;
         }
         .screenshot-item:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            transform: translateY(-3px);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
         }
         .screenshot-item img {
-            max-width: 100%;
-            height: auto;
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
             border-radius: 4px;
             cursor: pointer;
+            margin-bottom: 10px;
+        }
+        .screenshot-item .title {
+            font-weight: bold;
+            font-size: 14px;
+            color: #333;
+            margin-bottom: 5px;
+            height: 40px;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            line-clamp: 2;
         }
         .screenshot-item .url {
-            margin-top: 8px;
             font-size: 12px;
             color: #666;
             word-break: break-all;
-            max-height: 60px;
+            max-height: 40px;
             overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            line-clamp: 2;
+        }
+        .screenshot-item .url a {
+            color: #0066cc;
+            text-decoration: none;
+        }
+        .screenshot-item .url a:hover {
+            text-decoration: underline;
         }
         .modal {
             display: none;
@@ -413,12 +465,30 @@ class ScreenshotTool:
             text-align: center;
             margin-bottom: 20px;
             color: #666;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 6px;
+        }
+        @media (max-width: 1200px) {
+            .gallery {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+        @media (max-width: 900px) {
+            .gallery {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        @media (max-width: 600px) {
+            .gallery {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>网页截图预览</h1>
+        <h1>📸 网页截图预览</h1>
         <div class="stats">
             共 <strong>''' + str(len(png_files)) + '''</strong> 张截图，生成时间: ''' + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + '''
         </div>
@@ -430,8 +500,17 @@ class ScreenshotTool:
             # 从文件名还原URL
             url = self._filename_to_url(png_file.stem)
             
+            # 获取页面标题，如果没有则使用URL
+            title = url_title_map.get(url, url) if url_title_map else url
+            # 限制标题长度
+            if len(title) > 80:
+                display_title = title[:77] + "..."
+            else:
+                display_title = title
+            
             html += f'''            <div class="screenshot-item">
-                <img src="{self.output_dir}/{png_file.name}" alt="{url}" onclick="openModal(this)">
+                <img src="{self.output_dir}/{png_file.name}" alt="{title}" onclick="openModal(this)">
+                <div class="title" title="{title}">{display_title}</div>
                 <div class="url" title="{url}"><a href="{url}" target="_blank">{url}</a></div>
             </div>
 '''
@@ -449,10 +528,12 @@ class ScreenshotTool:
         function openModal(img) {
             document.getElementById('modal').style.display = 'block';
             document.getElementById('modal-img').src = img.src;
+            document.body.style.overflow = 'hidden'; // 防止背景滚动
         }
         
         function closeModal() {
             document.getElementById('modal').style.display = 'none';
+            document.body.style.overflow = 'auto'; // 恢复背景滚动
         }
         
         // 点击模态框背景关闭
@@ -519,11 +600,13 @@ def main():
     try:
         if args.url:
             # 截图单个URL
-            success = asyncio.run(tool.capture_single_url(args.url))
+            success, title = asyncio.run(tool.capture_single_url(args.url))
             if success:
                 print(f"截图成功: {args.url}")
+                print(f"页面标题: {title}")
                 # 单个URL也生成HTML
-                tool._generate_html_gallery()
+                url_title_map = {args.url: title}
+                tool._generate_html_gallery(url_title_map)
             else:
                 print(f"截图失败: {args.url}")
                 sys.exit(1)
