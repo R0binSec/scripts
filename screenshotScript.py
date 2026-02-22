@@ -13,6 +13,7 @@ import os
 import sys
 import logging
 import datetime
+import json
 from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 
@@ -38,11 +39,15 @@ class ScreenshotTool:
         """
         self.concurrency = concurrency
         self.current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        # self.output_dir = Path("img")
         self.output_dir = Path(f"img_{self.current_time}")
         
         # 创建输出目录
         self.output_dir.mkdir(exist_ok=True)
+        
+        # 存储URL到文件名的映射
+        self.url_to_filename = {}
+        # 存储文件名到URL的映射
+        self.filename_to_url = {}
     
     async def capture_screenshot(self, url: str, page) -> Tuple[bool, str]:
         """
@@ -60,6 +65,13 @@ class ScreenshotTool:
             filename = self._sanitize_filename(url)
             output_path = self.output_dir / f"{filename}.png"
             
+            # 保存URL和文件名的映射关系
+            self.url_to_filename[url] = filename
+            self.filename_to_url[filename] = url
+            
+            # 保存映射到文件（用于故障恢复）
+            self._save_url_mapping()
+            
             # 尝试加载页面
             try:
                 await page.goto(url, timeout=30000, wait_until='networkidle')
@@ -76,7 +88,7 @@ class ScreenshotTool:
                 
             except Exception as e:
                 logger.warning(f"页面加载异常但尝试截图: {url}, 错误: {str(e)[:50]}")
-                title = ''  # 加载异常时使用URL作为标题
+                title = url  # 加载异常时使用URL作为标题
             
             # 截图
             await page.screenshot(
@@ -94,6 +106,30 @@ class ScreenshotTool:
         except Exception as e:
             logger.error(f"截图失败: {url}, 错误: {str(e)[:100]}")
             return False, url
+    
+    def _save_url_mapping(self):
+        """保存URL映射关系到文件"""
+        mapping_file = self.output_dir / "url_mapping.json"
+        try:
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'url_to_filename': self.url_to_filename,
+                    'filename_to_url': self.filename_to_url
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存URL映射关系失败: {e}")
+    
+    def _load_url_mapping(self):
+        """从文件加载URL映射关系"""
+        mapping_file = self.output_dir / "url_mapping.json"
+        if mapping_file.exists():
+            try:
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    mapping = json.load(f)
+                    self.url_to_filename = mapping.get('url_to_filename', {})
+                    self.filename_to_url = mapping.get('filename_to_url', {})
+            except Exception as e:
+                logger.warning(f"加载URL映射关系失败: {e}")
     
     async def _capture_with_semaphore(self, url: str, context, semaphore: asyncio.Semaphore) -> tuple:
         """
@@ -289,7 +325,7 @@ class ScreenshotTool:
     
     def _sanitize_filename(self, url: str) -> str:
         """
-        清理URL，生成安全的文件名
+        清理URL，生成安全的文件名（改进版）
         
         Args:
             url: URL字符串
@@ -297,24 +333,80 @@ class ScreenshotTool:
         Returns:
             安全的文件名
         """
-        # 替换协议
-        filename = url.replace('http://', 'http__').replace('https://', 'https__')
+        import base64
+        import hashlib
         
-        # 替换特殊字符
-        filename = filename.replace('/', '_').replace('?', '_').replace('&', '_')
-        filename = filename.replace('=', '_').replace(':', '_').replace('*', '_')
-        filename = filename.replace('"', '_').replace('<', '_').replace('>', '_')
-        filename = filename.replace('|', '_').replace('\\', '_')
+        # 使用base64编码作为文件名，这是可逆的
+        # base64.urlsafe_b64encode会将+和/替换为-和_，已经是安全的
+        encoded = base64.urlsafe_b64encode(url.encode('utf-8')).decode('ascii')
         
-        # 限制文件名长度
-        if len(filename) > 100:
-            filename = filename[:100]
+        # 移除base64的填充字符=，用_EQ_代替以便恢复
+        filename = encoded.rstrip('=').replace('=', '_EQ_')
+        
+        # 如果文件名仍然太长，使用哈希值（但这样不可逆）
+        if len(filename) > 200:
+            # 使用URL的MD5哈希作为文件名（16进制，32字符）
+            filename = hashlib.md5(url.encode('utf-8')).hexdigest()
+            logger.warning(f"URL过长，使用MD5哈希作为文件名: {url[:50]}... -> {filename}")
         
         return filename
     
+    def _filename_to_url(self, filename: str) -> str:
+        """
+        从文件名还原URL（修复版）
+        
+        Args:
+            filename: 文件名（不含扩展名）
+        
+        Returns:
+            原始URL
+        """
+        # 先尝试从映射中查找
+        if filename in self.filename_to_url:
+            return self.filename_to_url[filename]
+        
+        # 如果没有映射，尝试从文件加载
+        self._load_url_mapping()
+        if filename in self.filename_to_url:
+            return self.filename_to_url[filename]
+        
+        # 如果仍然没有，尝试解码base64
+        try:
+            import base64
+            
+            # 恢复_EQ_为=
+            encoded = filename.replace('_EQ_', '=')
+            
+            # 添加base64填充字符
+            padding = 4 - len(encoded) % 4
+            if padding != 4:
+                encoded += '=' * padding
+            
+            # 解码
+            decoded_bytes = base64.urlsafe_b64decode(encoded)
+            url = decoded_bytes.decode('utf-8')
+            return url
+        except Exception as e:
+            # 如果解码失败，尝试旧的还原方法（不完美）
+            logger.warning(f"无法解码文件名 {filename}: {e}")
+            
+            # 尝试旧的还原方法
+            if filename.startswith('http__'):
+                url = 'http://' + filename[6:]
+            elif filename.startswith('https__'):
+                url = 'https://' + filename[7:]
+            else:
+                # 可能是MD5哈希，无法还原
+                return f"[无法还原原始URL: {filename}]"
+            
+            # 简单替换下划线为斜杠（不完美，但有bug）
+            # 这里应该只替换路径部分的下划线，但简单实现中难以区分
+            url = url.replace('_', '/')
+            return url
+    
     def _generate_html_gallery(self, url_title_map: Dict[str, str] = None) -> None:
         """
-        生成HTML图片链接页面，每行显示6个图片
+        生成HTML图片链接页面，每行显示4个图片
         
         Args:
             url_title_map: URL到标题的映射字典
@@ -497,8 +589,11 @@ class ScreenshotTool:
         
         # 添加图片项
         for png_file in png_files:
-            # 从文件名还原URL
-            url = self._filename_to_url(png_file.stem)
+            # 获取文件名（不含扩展名）
+            filename_without_ext = png_file.stem
+            
+            # 从映射中获取URL
+            url = self._filename_to_url(filename_without_ext)
             
             # 获取页面标题，如果没有则使用URL
             title = url_title_map.get(url, url) if url_title_map else url
@@ -508,10 +603,15 @@ class ScreenshotTool:
             else:
                 display_title = title
             
+            # 限制URL显示长度
+            display_url = url
+            if len(display_url) > 60:
+                display_url = display_url[:57] + "..."
+            
             html += f'''            <div class="screenshot-item">
                 <img src="{self.output_dir}/{png_file.name}" alt="{title}" onclick="openModal(this)">
                 <div class="title" title="{title}">{display_title}</div>
-                <div class="url" title="{url}"><a href="{url}" target="_blank">{url}</a></div>
+                <div class="url" title="{url}"><a href="{url}" target="_blank">{display_url}</a></div>
             </div>
 '''
         
@@ -554,24 +654,6 @@ class ScreenshotTool:
 </html>'''
         
         return html
-    
-    def _filename_to_url(self, filename: str) -> str:
-        """
-        从文件名还原URL
-        
-        Args:
-            filename: 文件名（不含扩展名）
-        
-        Returns:
-            原始URL
-        """
-        # 还原协议
-        url = filename.replace('http__', 'http://').replace('https__', 'https://')
-        
-        # 还原其他字符
-        url = url.replace('_', '/')
-        
-        return url
 
 
 def main():
